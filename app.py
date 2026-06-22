@@ -3,12 +3,11 @@ Bot de Facturas por WhatsApp
 Recibe una foto de factura por WhatsApp (vía Twilio), extrae los datos con
 Claude, y agrega una fila por producto en la primera hoja de un Google Sheet.
 
-Columnas que se llenan automáticamente (en este orden):
-Fecha Emision | N° Factura | Proveedor | Neto | Iva | Impuesto Espec. | Total | Ítem | Detalle
+Columnas que se llenan automaticamente (B-J):
+B: Fecha Emision | C: N Factura | D: Proveedor | E: Neto | F: Iva |
+G: Impuesto Espec. (vacio) | H: Total | I: Item (vacio) | J: Detalle
 
-- "Impuesto Espec." se deja siempre vacío (lo llena el usuario manualmente si aplica).
-- "Ítem" se deja siempre vacío (el usuario lo clasifica manualmente).
-- Si la factura tiene varios productos, se agrega una fila por producto.
+Datos empiezan en fila 4.
 """
 
 import os
@@ -22,16 +21,17 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
-# ---------- Configuración (se lee desde variables de entorno en Railway) ----------
+# ---------- Configuracion ----------
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]  # contenido completo del .json, como texto
+GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ---------- Conexión a Google Sheets ----------
+
+# ---------- Conexion a Google Sheets ----------
 def get_sheet():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(
@@ -43,13 +43,13 @@ def get_sheet():
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
-    return sh.get_worksheet(0)  # siempre la primera hoja (la "activa" del mes)
+    return sh.get_worksheet(0)  # siempre la primera hoja (la activa del mes)
 
 
-# ---------- Extracción de datos con Claude ----------
-PROMPT_EXTRACCION = """Eres un asistente que extrae datos de facturas de compras agrícolas chilenas.
+# ---------- Extraccion de datos con Claude ----------
+PROMPT_EXTRACCION = """Eres un asistente que extrae datos de facturas de compras agricolas chilenas.
 
-Analiza la imagen de esta factura y devuelve SOLO un JSON válido (sin texto adicional, sin
+Analiza la imagen de esta factura y devuelve SOLO un JSON valido (sin texto adicional, sin
 markdown, sin backticks) con esta estructura exacta:
 
 {
@@ -67,13 +67,13 @@ markdown, sin backticks) con esta estructura exacta:
 }
 
 Reglas:
-- Si la factura tiene varios productos/ítems distintos, crea una entrada en "productos" por cada uno,
-  con su neto, iva y total individual (neto + iva = total de esa línea).
+- Si la factura tiene varios productos/items distintos, crea una entrada en "productos" por cada uno,
+  con su neto, iva y total individual (neto + iva = total de esa linea).
 - Si la factura solo tiene un total general sin desglose por producto, crea un solo producto con
-  detalle = descripción general de la factura, y neto/iva/total correspondientes al total de la factura.
-- Los números van sin puntos de miles ni símbolos, solo el valor (ej. 150000, no "150.000" ni "$150.000").
-- Si algún dato no aparece en la imagen, usa null.
-- No incluyas la columna de Impuesto Específico, no la necesito.
+  detalle = descripcion general de la factura, y neto/iva/total correspondientes al total de la factura.
+- Los numeros van sin puntos de miles ni simbolos, solo el valor (ej. 150000, no "150.000" ni "$150.000").
+- Si algun dato no aparece en la imagen, usa null.
+- No incluyas la columna de Impuesto Especifico, no la necesito.
 """
 
 
@@ -96,37 +96,46 @@ def extraer_datos_factura(image_bytes, media_type):
         ],
     )
     texto = response.content[0].text.strip()
-    # por si acaso Claude agrega ```json ... ```
     texto = texto.replace("```json", "").replace("```", "").strip()
     return json.loads(texto)
 
 
 # ---------- Escribir en Google Sheets ----------
+def primera_fila_vacia(sheet):
+    """Busca la primera fila vacia en columna B a partir de fila 4."""
+    columna_b = sheet.col_values(2)  # columna B (indice 2 en gspread)
+    # fila 4 = indice 3 en lista 0-indexed
+    for i in range(3, len(columna_b)):
+        if str(columna_b[i]).strip() == "":
+            return i + 1  # gspread usa filas 1-indexadas
+    return max(len(columna_b) + 1, 4)  # minimo fila 4
+
+
 def agregar_filas(datos):
     sheet = get_sheet()
     for producto in datos.get("productos", []):
-        fila = [
+        fila_num = primera_fila_vacia(sheet)
+        valores = [
             datos.get("fecha_emision") or "",
             datos.get("numero_factura") or "",
             datos.get("proveedor") or "",
             producto.get("neto") or 0,
             producto.get("iva") or 0,
-            "",  # Impuesto Espec. - siempre vacío
+            "",  # Impuesto Espec. - siempre vacio
             producto.get("total") or 0,
-            "",  # Ítem - lo llena el usuario manualmente
+            "",  # Item - lo llena el usuario manualmente
             producto.get("detalle") or "",
         ]
-        sheet.append_row(fila, value_input_option="USER_ENTERED")
+        sheet.update(f"B{fila_num}:J{fila_num}", [valores], value_input_option="USER_ENTERED")
 
 
 # ---------- Webhook de Twilio ----------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     num_media = int(request.form.get("NumMedia", 0))
-    sender = request.form.get("From", "")
 
     if num_media == 0:
-        return responder_twiml("Envíame una foto de la factura para procesarla.")
+        return responder_twiml("Enviame una foto de la factura para procesarla.")
 
     try:
         media_url = request.form.get("MediaUrl0")
@@ -140,11 +149,11 @@ def webhook():
 
         n_productos = len(datos.get("productos", []))
         proveedor = datos.get("proveedor", "proveedor desconocido")
-        mensaje = f"✅ Factura de {proveedor} registrada: {n_productos} línea(s) agregada(s) a la planilla."
+        mensaje = f"Factura de {proveedor} registrada: {n_productos} linea(s) agregada(s) a la planilla."
         return responder_twiml(mensaje)
 
     except Exception as e:
-        return responder_twiml(f"⚠️ No pude procesar la factura: {str(e)}")
+        return responder_twiml(f"No pude procesar la factura: {str(e)}")
 
 
 def responder_twiml(mensaje):
