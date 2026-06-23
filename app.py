@@ -5,14 +5,15 @@ Claude, y agrega una fila por producto en la primera hoja de un Google Sheet.
 
 Columnas que se llenan automaticamente (B-J):
 B: Fecha Emision | C: N Factura | D: Proveedor | E: Neto | F: Iva |
-G: Impuesto Espec. (vacio) | H: Total | I: Item (vacio) | J: Detalle
+G: Impuesto Espec. | H: Total | I: Item (vacio) | J: Detalle
 
 Logica:
 - La columna "Valor" de cada item en la factura chilena SIEMPRE es el monto NETO.
 - IVA de cada item = neto x 19%
-- Total de cada item = neto + IVA
+- Impuesto Especifico = total impreso en factura - neto - iva (0 si no hay)
+- Total = neto + iva + impuesto especifico
 - Se agrega una fila por cada item.
-- Datos empiezan en fila 4.
+- Datos empiezan en fila 3.
 """
 
 import os
@@ -61,6 +62,7 @@ markdown, sin backticks) con esta estructura exacta:
   "fecha_emision": "DD-MM-AAAA",
   "numero_factura": "string",
   "proveedor": "string",
+  "total_factura": numero,
   "productos": [
     {
       "detalle": "nombre del producto o servicio",
@@ -72,7 +74,9 @@ markdown, sin backticks) con esta estructura exacta:
 Reglas CRITICAS:
 - La columna "Valor" que aparece en el detalle de cada item de una factura chilena
   SIEMPRE corresponde al valor NETO (sin IVA). Extrae ese valor en el campo "neto".
-- NO calcules ni extraigas el IVA ni el total por item — eso lo calcula el sistema.
+- "total_factura" es el TOTAL FINAL impreso en la factura (el gran total, incluyendo
+  neto + IVA + cualquier impuesto adicional como impuesto especifico a combustibles).
+- NO calcules ni extraigas el IVA ni el impuesto especifico — eso lo calcula el sistema.
 - Si la factura tiene varios items, crea una entrada en "productos" por cada uno.
 - Si la factura tiene un solo concepto general, crea una sola entrada.
 - Los numeros van sin puntos de miles ni simbolos (ej. 78990, no "78.990" ni "$78.990").
@@ -115,18 +119,21 @@ def primera_fila_vacia(sheet):
 
 def agregar_filas(datos):
     sheet = get_sheet()
+    total_factura = round(datos.get("total_factura") or 0)
+
     for producto in datos.get("productos", []):
         fila_num = primera_fila_vacia(sheet)
         neto = round(producto.get("neto") or 0)
         iva = round(neto * 0.19)
-        total = neto + iva
+        impuesto_esp = max(total_factura - neto - iva, 0)
+        total = neto + iva + impuesto_esp
         valores = [
             datos.get("fecha_emision") or "",
             datos.get("numero_factura") or "",
             datos.get("proveedor") or "",
             neto,
             iva,
-            "",      # Impuesto Espec. - siempre vacio
+            impuesto_esp if impuesto_esp > 0 else "",
             total,
             "",      # Item - lo llena el usuario manualmente
             producto.get("detalle") or "",
