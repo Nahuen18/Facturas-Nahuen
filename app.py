@@ -1,13 +1,18 @@
 """
 Bot de Facturas por WhatsApp
-Recibe una foto de factura por WhatsApp (vía Twilio), extrae los datos con
+Recibe una foto de factura por WhatsApp (via Twilio), extrae los datos con
 Claude, y agrega una fila por producto en la primera hoja de un Google Sheet.
 
 Columnas que se llenan automaticamente (B-J):
 B: Fecha Emision | C: N Factura | D: Proveedor | E: Neto | F: Iva |
 G: Impuesto Espec. (vacio) | H: Total | I: Item (vacio) | J: Detalle
 
-Datos empiezan en fila 4.
+Logica:
+- La columna "Valor" de cada item en la factura chilena SIEMPRE es el monto NETO.
+- IVA de cada item = neto x 19%
+- Total de cada item = neto + IVA
+- Se agrega una fila por cada item.
+- Datos empiezan en fila 4.
 """
 
 import os
@@ -43,7 +48,7 @@ def get_sheet():
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
-    return sh.get_worksheet(0)  # siempre la primera hoja (la activa del mes)
+    return sh.get_worksheet(0)
 
 
 # ---------- Extraccion de datos con Claude ----------
@@ -59,21 +64,19 @@ markdown, sin backticks) con esta estructura exacta:
   "productos": [
     {
       "detalle": "nombre del producto o servicio",
-      "neto": numero,
-      "iva": numero,
-      "total": numero
+      "neto": numero
     }
   ]
 }
 
-Reglas:
-- Si la factura tiene varios productos/items distintos, crea una entrada en "productos" por cada uno,
-  con su neto, iva y total individual (neto + iva = total de esa linea).
-- Si la factura solo tiene un total general sin desglose por producto, crea un solo producto con
-  detalle = descripcion general de la factura, y neto/iva/total correspondientes al total de la factura.
-- Los numeros van sin puntos de miles ni simbolos, solo el valor (ej. 150000, no "150.000" ni "$150.000").
+Reglas CRITICAS:
+- La columna "Valor" que aparece en el detalle de cada item de una factura chilena
+  SIEMPRE corresponde al valor NETO (sin IVA). Extrae ese valor en el campo "neto".
+- NO calcules ni extraigas el IVA ni el total por item — eso lo calcula el sistema.
+- Si la factura tiene varios items, crea una entrada en "productos" por cada uno.
+- Si la factura tiene un solo concepto general, crea una sola entrada.
+- Los numeros van sin puntos de miles ni simbolos (ej. 78990, no "78.990" ni "$78.990").
 - Si algun dato no aparece en la imagen, usa null.
-- No incluyas la columna de Impuesto Especifico, no la necesito.
 """
 
 
@@ -103,27 +106,29 @@ def extraer_datos_factura(image_bytes, media_type):
 # ---------- Escribir en Google Sheets ----------
 def primera_fila_vacia(sheet):
     """Busca la primera fila vacia en columna B a partir de fila 4."""
-    columna_b = sheet.col_values(2)  # columna B (indice 2 en gspread)
-    # fila 4 = indice 3 en lista 0-indexed
+    columna_b = sheet.col_values(2)
     for i in range(3, len(columna_b)):
         if str(columna_b[i]).strip() == "":
-            return i + 1  # gspread usa filas 1-indexadas
-    return max(len(columna_b) + 1, 4)  # minimo fila 4
+            return i + 1
+    return max(len(columna_b) + 1, 4)
 
 
 def agregar_filas(datos):
     sheet = get_sheet()
     for producto in datos.get("productos", []):
         fila_num = primera_fila_vacia(sheet)
+        neto = round(producto.get("neto") or 0)
+        iva = round(neto * 0.19)
+        total = neto + iva
         valores = [
             datos.get("fecha_emision") or "",
             datos.get("numero_factura") or "",
             datos.get("proveedor") or "",
-            producto.get("neto") or 0,
-            producto.get("iva") or 0,
-            "",  # Impuesto Espec. - siempre vacio
-            producto.get("total") or 0,
-            "",  # Item - lo llena el usuario manualmente
+            neto,
+            iva,
+            "",      # Impuesto Espec. - siempre vacio
+            total,
+            "",      # Item - lo llena el usuario manualmente
             producto.get("detalle") or "",
         ]
         sheet.update(f"B{fila_num}:J{fila_num}", [valores], value_input_option="USER_ENTERED")
