@@ -175,7 +175,7 @@ def agregar_filas(datos):
         valores = [
             datos.get("fecha_emision") or "",
             datos.get("numero_factura") or "",
-            datos.get("proveedor") or "",
+            datos.get("proveedor", "").title(),
             neto,
             iva,
             impuesto_esp if impuesto_esp > 0 else "",
@@ -210,7 +210,7 @@ def webhook():
         agregar_filas(datos)
 
         n_productos = len(datos.get("productos", []))
-        proveedor = datos.get("proveedor", "proveedor desconocido")
+        proveedor = datos.get("proveedor", "proveedor desconocido").title()
         mensaje = f"Factura de {proveedor} registrada: {n_productos} linea(s) agregada(s) a la planilla."
         return responder_twiml(mensaje)
 
