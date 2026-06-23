@@ -105,12 +105,12 @@ def extraer_datos_factura(image_bytes, media_type):
 
 # ---------- Escribir en Google Sheets ----------
 def primera_fila_vacia(sheet):
-    """Busca la primera fila vacia en columna B a partir de fila 4."""
+    """Busca la primera fila vacia en columna B a partir de fila 3."""
     columna_b = sheet.col_values(2)
-    for i in range(3, len(columna_b)):
+    for i in range(2, len(columna_b)):  # fila 3 = indice 2
         if str(columna_b[i]).strip() == "":
             return i + 1
-    return max(len(columna_b) + 1, 4)
+    return max(len(columna_b) + 1, 3)
 
 
 def agregar_filas(datos):
