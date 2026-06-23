@@ -10,9 +10,9 @@ G: Impuesto Espec. | H: Total | I: Item (vacio) | J: Detalle
 Logica:
 - La columna "Valor" de cada item en la factura chilena SIEMPRE es el monto NETO.
 - IVA de cada item = neto x 19%
-- Impuesto Especifico = total impreso en factura - neto - iva (0 si no hay)
-- Total = neto + iva + impuesto especifico
-- Se agrega una fila por cada item.
+- Impuesto Especifico SOLO se calcula si el detalle del item es un combustible.
+- Total = neto + iva + impuesto especifico (o neto + iva si no es combustible)
+- Si la factura tiene 2+ productos, columnas B/C/D se marcan en verde claro.
 - Datos empiezan en fila 3.
 """
 
@@ -35,6 +35,16 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ---------- Palabras clave de combustible ----------
+PALABRAS_COMBUSTIBLE = [
+    "bencina", "gasolina", "diesel", "diésel", "combustible",
+    "gas oil", "kerosene", "petróleo", "petroleo", "gnc",
+]
+
+def es_combustible(detalle):
+    detalle_lower = (detalle or "").lower()
+    return any(palabra in detalle_lower for palabra in PALABRAS_COMBUSTIBLE)
 
 
 # ---------- Conexion a Google Sheets ----------
@@ -111,21 +121,56 @@ def extraer_datos_factura(image_bytes, media_type):
 def primera_fila_vacia(sheet):
     """Busca la primera fila vacia en columna B a partir de fila 3."""
     columna_b = sheet.col_values(2)
-    for i in range(2, len(columna_b)):  # fila 3 = indice 2
+    for i in range(2, len(columna_b)):
         if str(columna_b[i]).strip() == "":
             return i + 1
     return max(len(columna_b) + 1, 3)
 
 
+def aplicar_color_verde(sheet, filas):
+    """Aplica color verde claro a columnas B, C, D de las filas indicadas."""
+    verde_claro = {"red": 0.714, "green": 0.843, "blue": 0.659}  # #B6D7A8
+    requests_body = []
+    for fila_num in filas:
+        requests_body.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet.id,
+                    "startRowIndex": fila_num - 1,
+                    "endRowIndex": fila_num,
+                    "startColumnIndex": 1,  # columna B
+                    "endColumnIndex": 4,    # columna D (inclusive)
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": verde_claro
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor"
+            }
+        })
+    if requests_body:
+        sheet.spreadsheet.batch_update({"requests": requests_body})
+
+
 def agregar_filas(datos):
     sheet = get_sheet()
     total_factura = round(datos.get("total_factura") or 0)
+    productos = datos.get("productos", [])
+    tiene_multiples = len(productos) > 1
+    filas_escritas = []
 
-    for producto in datos.get("productos", []):
+    for producto in productos:
         fila_num = primera_fila_vacia(sheet)
         neto = round(producto.get("neto") or 0)
         iva = round(neto * 0.19)
-        impuesto_esp = max(total_factura - neto - iva, 0)
+        detalle = producto.get("detalle") or ""
+
+        if es_combustible(detalle):
+            impuesto_esp = max(total_factura - neto - iva, 0)
+        else:
+            impuesto_esp = 0
+
         total = neto + iva + impuesto_esp
         valores = [
             datos.get("fecha_emision") or "",
@@ -136,9 +181,14 @@ def agregar_filas(datos):
             impuesto_esp if impuesto_esp > 0 else "",
             total,
             "",      # Item - lo llena el usuario manualmente
-            producto.get("detalle") or "",
+            detalle,
         ]
         sheet.update(f"B{fila_num}:J{fila_num}", [valores], value_input_option="USER_ENTERED")
+        filas_escritas.append(fila_num)
+
+    # Aplicar verde claro en B/C/D solo si hay 2+ productos
+    if tiene_multiples:
+        aplicar_color_verde(sheet, filas_escritas)
 
 
 # ---------- Webhook de Twilio ----------
