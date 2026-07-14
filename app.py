@@ -18,6 +18,7 @@ Variables de entorno necesarias:
 import os
 import json
 import base64
+import math
 import requests
 from flask import Flask, request, jsonify
 import anthropic
@@ -70,7 +71,9 @@ markdown, sin backticks) con esta estructura exacta:
   "fecha_emision": "DD-MM-AAAA",
   "numero_factura": "string",
   "proveedor": "string",
+  "neto_factura": numero,
   "total_factura": numero,
+  "descuento": numero,
   "productos": [
     {
       "detalle": "nombre del producto o servicio",
@@ -80,8 +83,11 @@ markdown, sin backticks) con esta estructura exacta:
 }
 
 Reglas CRITICAS:
-- La columna "Valor" de cada item SIEMPRE es el valor NETO (sin IVA).
-- "total_factura" es el TOTAL FINAL impreso en la factura.
+- La columna "Valor" de cada item SIEMPRE es el valor que aparece junto al producto en el detalle.
+- "neto_factura" es el MONTO NETO total impreso en el resumen final de la factura
+  (puede llamarse "Neto", "Monto Neto", "Base imponible" o similar).
+- "total_factura" es el TOTAL FINAL impreso en la factura (incluyendo IVA e impuestos adicionales).
+- "descuento" es el monto total de descuento que aparece en la factura (si no hay, usa 0).
 - NO calcules IVA ni impuesto especifico, eso lo hace el sistema.
 - Una entrada en "productos" por cada item distinto.
 - Numeros sin puntos de miles ni simbolos (ej. 78990).
@@ -119,6 +125,67 @@ def extraer_datos_factura(file_bytes, media_type="image/jpeg"):
     return json.loads(texto)
 
 
+# ---------- Logica de precios ----------
+def redondear(valor):
+    """Redondea al entero mas cercano: >=0.5 sube, <0.5 baja."""
+    return math.floor(valor + 0.5)
+
+
+def corregir_iva_incluido(productos, neto_factura):
+    """
+    Si la suma de valores del detalle > neto_factura, los precios incluyen IVA.
+    En ese caso divide cada valor por 1.19 para obtener el neto real.
+    """
+    suma_detalle = sum(p.get("neto") or 0 for p in productos)
+    if neto_factura and suma_detalle > neto_factura:
+        for p in productos:
+            p["neto"] = redondear((p.get("neto") or 0) / 1.19)
+    return productos
+
+
+def prorratear_descuento(productos, descuento):
+    """
+    Proratea el descuento en partes iguales entre los productos.
+    Si un producto queda negativo, se excluye del prorrateo y se redistribuye
+    entre los restantes. Si solo queda uno, se aplica al de mayor valor.
+    """
+    if not descuento or descuento <= 0:
+        return productos
+
+    netos = [p.get("neto") or 0 for p in productos]
+    indices_activos = list(range(len(netos)))
+
+    while True:
+        if not indices_activos:
+            break
+        parte = descuento / len(indices_activos)
+        nuevos_netos = netos[:]
+        negativos = []
+
+        for i in indices_activos:
+            nuevos_netos[i] = redondear(netos[i] - parte)
+            if nuevos_netos[i] < 0:
+                negativos.append(i)
+
+        if not negativos:
+            # Todos quedaron positivos, aplicar
+            netos = nuevos_netos
+            break
+        elif len(negativos) == len(indices_activos):
+            # Todos quedan negativos: aplicar descuento solo al de mayor valor
+            i_max = max(indices_activos, key=lambda i: netos[i])
+            netos[i_max] = max(redondear(netos[i_max] - descuento), 0)
+            break
+        else:
+            # Excluir negativos y redistribuir
+            indices_activos = [i for i in indices_activos if i not in negativos]
+
+    for i, p in enumerate(productos):
+        p["neto"] = netos[i]
+
+    return productos
+
+
 # ---------- Escribir en Google Sheets ----------
 def primera_fila_vacia(sheet):
     columna_b = sheet.col_values(2)
@@ -130,12 +197,12 @@ def primera_fila_vacia(sheet):
 
 def factura_duplicada(sheet, numero_factura):
     """Verifica si el numero de factura ya existe en la columna C."""
-    columna_c = sheet.col_values(3)  # columna C = N° Factura
+    columna_c = sheet.col_values(3)
     return str(numero_factura) in [str(v).strip() for v in columna_c]
 
 
-def aplicar_color(sheet, filas, color):
-    """Aplica un color a las columnas B-J de las filas indicadas."""
+def aplicar_color(sheet, filas, color, col_inicio=1, col_fin=10):
+    """Aplica un color a un rango de columnas de las filas indicadas."""
     requests_body = []
     for fila_num in filas:
         requests_body.append({
@@ -144,32 +211,10 @@ def aplicar_color(sheet, filas, color):
                     "sheetId": sheet.id,
                     "startRowIndex": fila_num - 1,
                     "endRowIndex": fila_num,
-                    "startColumnIndex": 1,   # columna B
-                    "endColumnIndex": 10,    # columna J (inclusive)
+                    "startColumnIndex": col_inicio,
+                    "endColumnIndex": col_fin,
                 },
                 "cell": {"userEnteredFormat": {"backgroundColor": color}},
-                "fields": "userEnteredFormat.backgroundColor"
-            }
-        })
-    if requests_body:
-        sheet.spreadsheet.batch_update({"requests": requests_body})
-
-
-def aplicar_color_verde(sheet, filas):
-    """Verde claro en columnas B-D para facturas con multiples productos."""
-    verde_claro = {"red": 0.714, "green": 0.843, "blue": 0.659}
-    requests_body = []
-    for fila_num in filas:
-        requests_body.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet.id,
-                    "startRowIndex": fila_num - 1,
-                    "endRowIndex": fila_num,
-                    "startColumnIndex": 1,  # columna B
-                    "endColumnIndex": 4,    # columna D (inclusive)
-                },
-                "cell": {"userEnteredFormat": {"backgroundColor": verde_claro}},
                 "fields": "userEnteredFormat.backgroundColor"
             }
         })
@@ -180,16 +225,25 @@ def aplicar_color_verde(sheet, filas):
 def agregar_filas(datos):
     sheet = get_sheet()
     total_factura = round(datos.get("total_factura") or 0)
-    productos = datos.get("productos", [])
-    tiene_multiples = len(productos) > 1
+    neto_factura  = datos.get("neto_factura") or 0
+    descuento     = datos.get("descuento") or 0
+    productos     = datos.get("productos", [])
     numero_factura = datos.get("numero_factura") or ""
-    es_duplicada = factura_duplicada(sheet, numero_factura)
+    es_duplicada  = factura_duplicada(sheet, numero_factura)
+
+    # 1. Corregir si los precios del detalle incluyen IVA
+    productos = corregir_iva_incluido(productos, neto_factura)
+
+    # 2. Prorratear descuento si corresponde
+    productos = prorratear_descuento(productos, descuento)
+
+    tiene_multiples = len(productos) > 1
     filas_escritas = []
 
     for producto in productos:
         fila_num = primera_fila_vacia(sheet)
         neto = round(producto.get("neto") or 0)
-        iva = round(neto * 0.19)
+        iva  = round(neto * 0.19)
         detalle = (producto.get("detalle") or "").capitalize()
         impuesto_esp = max(total_factura - neto - iva, 0) if es_combustible(detalle) else 0
         total = neto + iva + impuesto_esp
@@ -208,20 +262,20 @@ def agregar_filas(datos):
         sheet.update(f"B{fila_num}:J{fila_num}", [valores], value_input_option="USER_ENTERED")
         filas_escritas.append(fila_num)
 
+    # Colores
     if es_duplicada:
-        # Marca todas las columnas B-J en rojo
         rojo = {"red": 0.918, "green": 0.298, "blue": 0.235}
-        aplicar_color(sheet, filas_escritas, rojo)
+        aplicar_color(sheet, filas_escritas, rojo, col_inicio=1, col_fin=10)
         print(f"DUPLICADA: Factura {numero_factura} ya existia en la planilla.")
     elif tiene_multiples:
-        aplicar_color_verde(sheet, filas_escritas)
+        verde_claro = {"red": 0.714, "green": 0.843, "blue": 0.659}
+        aplicar_color(sheet, filas_escritas, verde_claro, col_inicio=1, col_fin=4)
 
     return len(productos), datos.get("proveedor", "proveedor desconocido").title(), es_duplicada
 
 
 # ---------- Descargar archivo desde Meta ----------
 def descargar_archivo_meta(media_id):
-    """Descarga imagen o PDF desde los servidores de Meta."""
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
     url_info = requests.get(
         f"https://graph.facebook.com/v19.0/{media_id}",
