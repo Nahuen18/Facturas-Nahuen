@@ -38,10 +38,11 @@ SPREADSHEET_ID          = os.environ["SPREADSHEET_ID"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ---------- Idempotencia y cola de procesamiento ----------
+# ---------- Idempotencia, cola y control de fila ----------
 mensajes_procesados = set()   # guarda los wamid ya procesados
 MAX_IDS_MEMORIA = 1000        # tope para que el set no crezca sin limite
 cola_facturas = queue.Queue() # facturas pendientes de procesar en segundo plano
+proxima_fila = None           # siguiente fila a escribir; se calcula una sola vez
 
 # ---------- Palabras clave de combustible ----------
 PALABRAS_COMBUSTIBLE = [
@@ -195,6 +196,10 @@ def prorratear_descuento(productos, descuento):
 
 # ---------- Escribir en Google Sheets ----------
 def primera_fila_vacia(sheet):
+    """
+    Lectura 'fria' que se usa UNA sola vez (al arrancar o tras reinicio) para
+    saber en que fila retomar. Despues el worker lleva la cuenta en memoria.
+    """
     columna_b = sheet.col_values(2)
     for i in range(2, len(columna_b)):
         if str(columna_b[i]).strip() == "":
@@ -230,6 +235,7 @@ def aplicar_color(sheet, filas, color, col_inicio=1, col_fin=10):
 
 
 def agregar_filas(datos):
+    global proxima_fila
     sheet = get_sheet()
     total_factura = round(datos.get("total_factura") or 0)
     neto_factura  = datos.get("neto_factura") or 0
@@ -244,18 +250,28 @@ def agregar_filas(datos):
     # 2. Prorratear descuento si corresponde
     productos = prorratear_descuento(productos, descuento)
 
-    tiene_multiples = len(productos) > 1
-    filas_escritas = []
+    if not productos:
+        return 0, datos.get("proveedor", "proveedor desconocido").title(), es_duplicada
 
+    # 3. Fila donde escribir: se calcula UNA vez y luego se lleva en memoria.
+    #    Como el worker es unico y secuencial, nadie mas escribe, asi que el
+    #    contador nunca choca ni depende de releer la planilla (que llega con
+    #    retraso y provocaba que las facturas se pisaran entre si).
+    if proxima_fila is None:
+        proxima_fila = primera_fila_vacia(sheet)
+
+    tiene_multiples = len(productos) > 1
+
+    # 4. Armar todas las filas de esta factura y escribirlas en UNA sola llamada
+    matriz = []
     for producto in productos:
-        fila_num = primera_fila_vacia(sheet)
         neto = round(producto.get("neto") or 0)
         iva  = round(neto * 0.19)
         detalle = (producto.get("detalle") or "").capitalize()
         impuesto_esp = max(total_factura - neto - iva, 0) if es_combustible(detalle) else 0
         total = neto + iva + impuesto_esp
 
-        valores = [
+        matriz.append([
             datos.get("fecha_emision") or "",
             numero_factura,
             datos.get("proveedor", "").title(),
@@ -265,11 +281,15 @@ def agregar_filas(datos):
             total,
             "",
             detalle,
-        ]
-        sheet.update(f"B{fila_num}:J{fila_num}", [valores], value_input_option="USER_ENTERED")
-        filas_escritas.append(fila_num)
+        ])
 
-    # Colores
+    fila_inicio = proxima_fila
+    fila_fin    = proxima_fila + len(matriz) - 1
+    sheet.update(f"B{fila_inicio}:J{fila_fin}", matriz, value_input_option="USER_ENTERED")
+    filas_escritas = list(range(fila_inicio, fila_fin + 1))
+    proxima_fila = fila_fin + 1   # avanzar en memoria, sin releer la planilla
+
+    # 5. Colores
     if es_duplicada:
         rojo = {"red": 0.918, "green": 0.298, "blue": 0.235}
         aplicar_color(sheet, filas_escritas, rojo, col_inicio=1, col_fin=10)
@@ -299,8 +319,8 @@ def descargar_archivo_meta(media_id):
 def worker_facturas():
     """
     Corre en un hilo aparte. Toma facturas de la cola y las procesa de a una,
-    en orden. Al ser secuencial, evita colisiones al buscar la primera fila
-    vacia en la planilla y no satura la API de Google Sheets.
+    en orden. Al ser secuencial y unico, evita colisiones al escribir en la
+    planilla y no satura la API de Google Sheets.
     """
     while True:
         media_id, message_id = cola_facturas.get()
