@@ -36,6 +36,10 @@ SPREADSHEET_ID          = os.environ["SPREADSHEET_ID"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ---------- Idempotencia (evitar procesar el mismo mensaje 2 o 3 veces) ----------
+mensajes_procesados = set()   # guarda los wamid ya procesados
+MAX_IDS_MEMORIA = 1000        # tope para que el set no crezca sin limite
+
 # ---------- Palabras clave de combustible ----------
 PALABRAS_COMBUSTIBLE = [
     "bencina", "gasolina", "diesel", "diésel", "combustible",
@@ -302,12 +306,22 @@ def verificar_webhook():
 @app.route("/webhook", methods=["POST"])
 def recibir_mensaje():
     data = request.get_json(silent=True) or {}
+    message_id = None
 
     try:
         entry   = data["entry"][0]
         changes = entry["changes"][0]["value"]
         mensaje = changes["messages"][0]
+        message_id = mensaje.get("id")   # wamid unico de cada mensaje
         tipo    = mensaje.get("type")
+
+        # --- Idempotencia: ignorar reintentos de Meta del mismo mensaje ---
+        if message_id in mensajes_procesados:
+            print(f"Mensaje {message_id} ya procesado; se ignora el reintento.")
+            return jsonify({"status": "duplicate_ignored"}), 200
+        mensajes_procesados.add(message_id)
+        if len(mensajes_procesados) > MAX_IDS_MEMORIA:
+            mensajes_procesados.pop()
 
         if tipo == "image":
             media_id = mensaje["image"]["id"]
@@ -326,6 +340,9 @@ def recibir_mensaje():
             print(f"Factura de {proveedor} registrada: {n_productos} linea(s).")
 
     except Exception as e:
+        # Si fallo el procesamiento, liberar el id para permitir un reintento
+        if message_id:
+            mensajes_procesados.discard(message_id)
         print(f"Error procesando mensaje: {e}")
 
     return jsonify({"status": "ok"}), 200
