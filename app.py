@@ -19,6 +19,8 @@ import os
 import json
 import base64
 import math
+import queue
+import threading
 import requests
 from flask import Flask, request, jsonify
 import anthropic
@@ -36,9 +38,10 @@ SPREADSHEET_ID          = os.environ["SPREADSHEET_ID"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ---------- Idempotencia (evitar procesar el mismo mensaje 2 o 3 veces) ----------
+# ---------- Idempotencia y cola de procesamiento ----------
 mensajes_procesados = set()   # guarda los wamid ya procesados
 MAX_IDS_MEMORIA = 1000        # tope para que el set no crezca sin limite
+cola_facturas = queue.Queue() # facturas pendientes de procesar en segundo plano
 
 # ---------- Palabras clave de combustible ----------
 PALABRAS_COMBUSTIBLE = [
@@ -292,6 +295,36 @@ def descargar_archivo_meta(media_id):
     return resp.content, mime_type
 
 
+# ---------- Worker de fondo: procesa la cola una factura a la vez ----------
+def worker_facturas():
+    """
+    Corre en un hilo aparte. Toma facturas de la cola y las procesa de a una,
+    en orden. Al ser secuencial, evita colisiones al buscar la primera fila
+    vacia en la planilla y no satura la API de Google Sheets.
+    """
+    while True:
+        media_id, message_id = cola_facturas.get()
+        try:
+            file_bytes, mime_type = descargar_archivo_meta(media_id)
+            datos = extraer_datos_factura(file_bytes, mime_type)
+            n_productos, proveedor, es_duplicada = agregar_filas(datos)
+            if es_duplicada:
+                print(f"Factura DUPLICADA de {proveedor} agregada y marcada en rojo.")
+            else:
+                print(f"Factura de {proveedor} registrada: {n_productos} linea(s).")
+        except Exception as e:
+            # Si fallo, liberar el id para que un reintento de Meta pueda reprocesarlo
+            if message_id:
+                mensajes_procesados.discard(message_id)
+            print(f"Error procesando factura {message_id}: {e}")
+        finally:
+            cola_facturas.task_done()
+
+
+# Iniciar el worker de fondo al arrancar la app (funciona bajo gunicorn tambien)
+threading.Thread(target=worker_facturas, daemon=True).start()
+
+
 # ---------- Webhook ----------
 @app.route("/webhook", methods=["GET"])
 def verificar_webhook():
@@ -305,46 +338,44 @@ def verificar_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def recibir_mensaje():
+    """
+    Responde 200 de inmediato y encola cada factura para procesarla en segundo
+    plano. Asi Meta nunca hace timeout ni reintenta, y no se pierde ninguna.
+    """
     data = request.get_json(silent=True) or {}
-    message_id = None
 
     try:
         entry   = data["entry"][0]
         changes = entry["changes"][0]["value"]
-        mensaje = changes["messages"][0]
-        message_id = mensaje.get("id")   # wamid unico de cada mensaje
-        tipo    = mensaje.get("type")
 
-        # --- Idempotencia: ignorar reintentos de Meta del mismo mensaje ---
-        if message_id in mensajes_procesados:
-            print(f"Mensaje {message_id} ya procesado; se ignora el reintento.")
-            return jsonify({"status": "duplicate_ignored"}), 200
-        mensajes_procesados.add(message_id)
-        if len(mensajes_procesados) > MAX_IDS_MEMORIA:
-            mensajes_procesados.pop()
+        # Iterar TODOS los mensajes del payload (Meta puede enviar varios juntos)
+        for mensaje in changes.get("messages", []):
+            message_id = mensaje.get("id")   # wamid unico de cada mensaje
+            tipo       = mensaje.get("type")
 
-        if tipo == "image":
-            media_id = mensaje["image"]["id"]
-        elif tipo == "document":
-            media_id = mensaje["document"]["id"]
-        else:
-            return jsonify({"status": "ignored"}), 200
+            # Idempotencia: ignorar reintentos del mismo mensaje
+            if message_id in mensajes_procesados:
+                print(f"Mensaje {message_id} ya encolado; se ignora el reintento.")
+                continue
 
-        file_bytes, mime_type = descargar_archivo_meta(media_id)
-        datos = extraer_datos_factura(file_bytes, mime_type)
-        n_productos, proveedor, es_duplicada = agregar_filas(datos)
+            if tipo == "image":
+                media_id = mensaje["image"]["id"]
+            elif tipo == "document":
+                media_id = mensaje["document"]["id"]
+            else:
+                continue
 
-        if es_duplicada:
-            print(f"Factura DUPLICADA de {proveedor} agregada y marcada en rojo.")
-        else:
-            print(f"Factura de {proveedor} registrada: {n_productos} linea(s).")
+            mensajes_procesados.add(message_id)
+            if len(mensajes_procesados) > MAX_IDS_MEMORIA:
+                mensajes_procesados.pop()
+
+            cola_facturas.put((media_id, message_id))
+            print(f"Factura encolada ({message_id}). Pendientes: {cola_facturas.qsize()}")
 
     except Exception as e:
-        # Si fallo el procesamiento, liberar el id para permitir un reintento
-        if message_id:
-            mensajes_procesados.discard(message_id)
-        print(f"Error procesando mensaje: {e}")
+        print(f"Error encolando mensaje: {e}")
 
+    # Responder de inmediato, sin esperar el procesamiento
     return jsonify({"status": "ok"}), 200
 
 
@@ -355,4 +386,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
