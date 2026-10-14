@@ -17,6 +17,7 @@ Variables de entorno necesarias:
 
 import os
 import json
+import time
 import base64
 import math
 import queue
@@ -36,7 +37,14 @@ WHATSAPP_ACCESS_TOKEN   = os.environ["WHATSAPP_ACCESS_TOKEN"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID          = os.environ["SPREADSHEET_ID"]
 
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# timeout y reintentos del cliente de Claude: si una llamada se cuelga, corta
+# a los 60s en vez de quedarse esperando para siempre y bloquear el worker.
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=2)
+
+# Timeouts de red (segundos) para las llamadas a Meta. (conexion, lectura)
+HTTP_TIMEOUT = (15, 60)
+# Reintentos del worker ante cortes transitorios de red
+MAX_REINTENTOS = 3
 
 # ---------- Idempotencia, cola y control de fila ----------
 mensajes_procesados = set()   # guarda los wamid ya procesados
@@ -349,13 +357,18 @@ def agregar_filas(datos):
 # ---------- Descargar archivo desde Meta ----------
 def descargar_archivo_meta(media_id):
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
-    url_info = requests.get(
+    # 1) Pedir la URL del media (con timeout para que no se cuelgue)
+    r_info = requests.get(
         f"https://graph.facebook.com/v19.0/{media_id}",
-        headers=headers
-    ).json()
+        headers=headers,
+        timeout=HTTP_TIMEOUT,
+    )
+    r_info.raise_for_status()
+    url_info = r_info.json()
     download_url = url_info.get("url")
     mime_type = url_info.get("mime_type", "image/jpeg")
-    resp = requests.get(download_url, headers=headers)
+    # 2) Descargar el archivo (con timeout)
+    resp = requests.get(download_url, headers=headers, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.content, mime_type
 
@@ -370,15 +383,34 @@ def worker_facturas():
     while True:
         media_id, message_id = cola_facturas.get()
         try:
-            file_bytes, mime_type = descargar_archivo_meta(media_id)
-            datos = extraer_datos_factura(file_bytes, mime_type)
-            n_productos, proveedor, es_duplicada = agregar_filas(datos)
-            if es_duplicada:
-                print(f"Factura DUPLICADA de {proveedor} agregada y marcada en rojo.")
-            else:
-                print(f"Factura de {proveedor} registrada: {n_productos} linea(s).")
+            # Reintentar ante cortes de red transitorios (connection reset,
+            # timeouts). Como la escritura a la planilla es la ultima llamada,
+            # un fallo antes de ella no deja nada a medias y es seguro reintentar.
+            ultimo_error = None
+            for intento in range(1, MAX_REINTENTOS + 1):
+                try:
+                    file_bytes, mime_type = descargar_archivo_meta(media_id)
+                    datos = extraer_datos_factura(file_bytes, mime_type)
+                    n_productos, proveedor, es_duplicada = agregar_filas(datos)
+                    if es_duplicada:
+                        print(f"Factura DUPLICADA de {proveedor} agregada y marcada en rojo.")
+                    else:
+                        print(f"Factura de {proveedor} registrada: {n_productos} linea(s).")
+                    ultimo_error = None
+                    break
+                except (requests.exceptions.RequestException, ConnectionError) as e:
+                    ultimo_error = e
+                    print(f"Intento {intento}/{MAX_REINTENTOS} fallo (red) en {message_id}: {e}")
+                    time.sleep(2 * intento)   # espera creciente antes de reintentar
+
+            if ultimo_error is not None:
+                # Agotados los reintentos: liberar el id para que Meta pueda reenviar
+                if message_id:
+                    mensajes_procesados.discard(message_id)
+                print(f"Factura {message_id} NO procesada tras {MAX_REINTENTOS} intentos: {ultimo_error}")
+
         except Exception as e:
-            # Si fallo, liberar el id para que un reintento de Meta pueda reprocesarlo
+            # Cualquier otro error (ej. JSON invalido de Claude): liberar el id
             if message_id:
                 mensajes_procesados.discard(message_id)
             print(f"Error procesando factura {message_id}: {e}")
