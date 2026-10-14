@@ -55,6 +55,23 @@ def es_combustible(detalle):
     return any(palabra in detalle_lower for palabra in PALABRAS_COMBUSTIBLE)
 
 
+# ---------- Proveedores que NO se desglosan por item ----------
+# Para estos se registra UNA sola fila usando los valores IMPRESOS de la
+# factura (sin calcular ni aplicar descuentos):
+#   - neto  = MONTO NETO + MONTO EXENTO
+#   - iva   = I.V.A. impreso (textual)
+#   - total = TOTAL impreso (textual)
+# En la columna Detalle se pone el item de mayor valor neto.
+# La comparacion normaliza el nombre (minusculas y sin espacios), asi que
+# "Luzparral S.A.", "LUZ PARRAL", etc. calzan igual. Agrega mas claves si
+# quieres el mismo trato para otro proveedor.
+PROVEEDORES_SIN_DESGLOSE = ["luzparral"]
+
+def sin_desglose(proveedor):
+    prov = "".join((proveedor or "").lower().split())
+    return any(clave in prov for clave in PROVEEDORES_SIN_DESGLOSE)
+
+
 # ---------- Conexion a Google Sheets ----------
 def get_sheet():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -80,6 +97,8 @@ markdown, sin backticks) con esta estructura exacta:
   "numero_factura": "string",
   "proveedor": "string",
   "neto_factura": numero,
+  "monto_exento": numero,
+  "iva_factura": numero,
   "total_factura": numero,
   "descuento": numero,
   "productos": [
@@ -94,6 +113,8 @@ Reglas CRITICAS:
 - La columna "Valor" de cada item SIEMPRE es el valor que aparece junto al producto en el detalle.
 - "neto_factura" es el MONTO NETO total impreso en el resumen final de la factura
   (puede llamarse "Neto", "Monto Neto", "Base imponible" o similar).
+- "monto_exento" es el MONTO EXENTO impreso en el resumen de la factura (si no aparece, usa 0).
+- "iva_factura" es el valor del I.V.A. impreso en el resumen de la factura (copialo tal cual, no lo calcules).
 - "total_factura" es el TOTAL FINAL impreso en la factura (incluyendo IVA e impuestos adicionales).
 - "descuento" es el monto total de descuento que aparece en la factura (si no hay, usa 0).
 - NO calcules IVA ni impuesto especifico, eso lo hace el sistema.
@@ -240,56 +261,80 @@ def agregar_filas(datos):
     total_factura = round(datos.get("total_factura") or 0)
     neto_factura  = datos.get("neto_factura") or 0
     descuento     = datos.get("descuento") or 0
-    productos     = datos.get("productos", [])
+    productos     = datos.get("productos", []) or []
     numero_factura = datos.get("numero_factura") or ""
+    proveedor_nombre = datos.get("proveedor", "") or ""
     es_duplicada  = factura_duplicada(sheet, numero_factura)
 
-    # 1. Corregir si los precios del detalle incluyen IVA
-    productos = corregir_iva_incluido(productos, neto_factura)
-
-    # 2. Prorratear descuento si corresponde
-    productos = prorratear_descuento(productos, descuento)
-
-    if not productos:
-        return 0, datos.get("proveedor", "proveedor desconocido").title(), es_duplicada
-
-    # 3. Fila donde escribir: se calcula UNA vez y luego se lleva en memoria.
-    #    Como el worker es unico y secuencial, nadie mas escribe, asi que el
-    #    contador nunca choca ni depende de releer la planilla (que llega con
-    #    retraso y provocaba que las facturas se pisaran entre si).
+    # ----- Fila inicial en memoria (una sola vez) -----
     if proxima_fila is None:
         proxima_fila = primera_fila_vacia(sheet)
 
-    tiene_multiples = len(productos) > 1
+    # ===== Caso especial: proveedores sin desglose (ej. Luz Parral) =====
+    # Se usa UNA sola fila con los valores IMPRESOS de la factura:
+    #   neto  = MONTO NETO + MONTO EXENTO
+    #   iva   = I.V.A. impreso (textual)
+    #   total = TOTAL impreso (textual)
+    # No se calcula IVA ni se aplica descuento (ya viene reflejado en el neto).
+    if sin_desglose(proveedor_nombre):
+        monto_exento = datos.get("monto_exento") or 0
+        neto  = round((neto_factura or 0) + (monto_exento or 0))
+        iva   = round(datos.get("iva_factura") or 0)
+        total = round(total_factura or 0)
+        detalle = ""
+        if productos:
+            detalle_top = max(productos, key=lambda p: p.get("neto") or 0)
+            detalle = (detalle_top.get("detalle") or "").capitalize()
 
-    # 4. Armar todas las filas de esta factura y escribirlas en UNA sola llamada
-    matriz = []
-    for producto in productos:
-        neto = round(producto.get("neto") or 0)
-        iva  = round(neto * 0.19)
-        detalle = (producto.get("detalle") or "").capitalize()
-        impuesto_esp = max(total_factura - neto - iva, 0) if es_combustible(detalle) else 0
-        total = neto + iva + impuesto_esp
-
-        matriz.append([
+        matriz = [[
             datos.get("fecha_emision") or "",
             numero_factura,
-            datos.get("proveedor", "").title(),
+            proveedor_nombre.title(),
             neto,
             iva,
-            impuesto_esp if impuesto_esp > 0 else "",
+            "",        # impuesto especifico: no aplica
             total,
-            "",
+            "",        # item (vacio)
             detalle,
-        ])
+        ]]
+        tiene_multiples = False
 
+    # ===== Logica normal: una fila por producto =====
+    else:
+        productos = corregir_iva_incluido(productos, neto_factura)
+        productos = prorratear_descuento(productos, descuento)
+
+        if not productos:
+            return 0, (proveedor_nombre or "proveedor desconocido").title(), es_duplicada
+
+        tiene_multiples = len(productos) > 1
+        matriz = []
+        for producto in productos:
+            neto = round(producto.get("neto") or 0)
+            iva  = round(neto * 0.19)
+            detalle = (producto.get("detalle") or "").capitalize()
+            impuesto_esp = max(total_factura - neto - iva, 0) if es_combustible(detalle) else 0
+            total = neto + iva + impuesto_esp
+            matriz.append([
+                datos.get("fecha_emision") or "",
+                numero_factura,
+                proveedor_nombre.title(),
+                neto,
+                iva,
+                impuesto_esp if impuesto_esp > 0 else "",
+                total,
+                "",
+                detalle,
+            ])
+
+    # ----- Escribir todas las filas de la factura en UNA sola llamada -----
     fila_inicio = proxima_fila
     fila_fin    = proxima_fila + len(matriz) - 1
     sheet.update(f"B{fila_inicio}:J{fila_fin}", matriz, value_input_option="USER_ENTERED")
     filas_escritas = list(range(fila_inicio, fila_fin + 1))
     proxima_fila = fila_fin + 1   # avanzar en memoria, sin releer la planilla
 
-    # 5. Colores
+    # ----- Colores -----
     if es_duplicada:
         rojo = {"red": 0.918, "green": 0.298, "blue": 0.235}
         aplicar_color(sheet, filas_escritas, rojo, col_inicio=1, col_fin=10)
@@ -298,7 +343,7 @@ def agregar_filas(datos):
         verde_claro = {"red": 0.714, "green": 0.843, "blue": 0.659}
         aplicar_color(sheet, filas_escritas, verde_claro, col_inicio=1, col_fin=4)
 
-    return len(productos), datos.get("proveedor", "proveedor desconocido").title(), es_duplicada
+    return len(matriz), (proveedor_nombre or "proveedor desconocido").title(), es_duplicada
 
 
 # ---------- Descargar archivo desde Meta ----------
