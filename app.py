@@ -73,7 +73,7 @@ def es_combustible(detalle):
 # La comparacion normaliza el nombre (minusculas y sin espacios), asi que
 # "Luzparral S.A.", "LUZ PARRAL", etc. calzan igual. Agrega mas claves si
 # quieres el mismo trato para otro proveedor.
-PROVEEDORES_SIN_DESGLOSE = ["luzparral"]
+PROVEEDORES_SIN_DESGLOSE = ["luzparral", "chilexpress", "entel"]
 
 def sin_desglose(proveedor):
     prov = "".join((proveedor or "").lower().split())
@@ -170,11 +170,17 @@ def redondear(valor):
 
 def corregir_iva_incluido(productos, neto_factura):
     """
-    Si la suma de valores del detalle > neto_factura, los precios incluyen IVA.
-    En ese caso divide cada valor por 1.19 para obtener el neto real.
+    Detecta cuando los valores del detalle vienen con IVA incluido y los corrige
+    dividiendo por 1.19.
+
+    Un caso real de IVA incluido deja la suma del detalle ~19% por encima del
+    MONTO NETO impreso. Por eso se exige un MARGEN (5%) antes de corregir: asi
+    una diferencia de pocos pesos por redondeo de la propia factura (p.ej. items
+    que suman 55.799 contra un neto impreso de 55.798) NO gatilla la correccion
+    y los netos se respetan tal cual.
     """
     suma_detalle = sum(p.get("neto") or 0 for p in productos)
-    if neto_factura and suma_detalle > neto_factura:
+    if neto_factura and suma_detalle > neto_factura * 1.05:
         for p in productos:
             p["neto"] = redondear((p.get("neto") or 0) / 1.19)
     return productos
