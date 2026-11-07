@@ -22,6 +22,7 @@ import base64
 import math
 import queue
 import threading
+import datetime
 import requests
 from flask import Flask, request, jsonify
 import anthropic
@@ -50,7 +51,15 @@ MAX_REINTENTOS = 3
 mensajes_procesados = set()   # guarda los wamid ya procesados
 MAX_IDS_MEMORIA = 1000        # tope para que el set no crezca sin limite
 cola_facturas = queue.Queue() # facturas pendientes de procesar en segundo plano
-proxima_fila = None           # siguiente fila a escribir; se calcula una sola vez
+# Contadores separados POR PESTAÑA (clave = titulo de la hoja), para que el
+# contador de un mes no se mezcle con el de otro.
+proxima_fila = {}             # {titulo_hoja: siguiente fila a escribir}
+ultima_escritura_ts = {}      # {titulo_hoja: momento de la ultima escritura}
+# Si paso mas de este tiempo sin escribir, se asume que empieza una tanda nueva
+# y se vuelve a leer la planilla para recolocar el contador (maneja cambio de
+# mes, limpieza manual de filas o reinicios). Dentro de una rafaga rapida de
+# facturas NO se re-sincroniza, para no chocar por el retraso de Google Sheets.
+SEGUNDOS_IDLE_RESYNC = 30
 
 # ---------- Palabras clave de combustible ----------
 PALABRAS_COMBUSTIBLE = [
@@ -81,7 +90,46 @@ def sin_desglose(proveedor):
 
 
 # ---------- Conexion a Google Sheets ----------
-def get_sheet():
+# Nombre de la pestaña por mes (deben coincidir con los nombres en la planilla)
+MESES_ABREV = {
+    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+}
+
+
+def mes_actual_abrev():
+    """Abreviatura del mes actual en horario de Chile (respaldo)."""
+    try:
+        from zoneinfo import ZoneInfo
+        ahora = datetime.datetime.now(ZoneInfo("America/Santiago"))
+    except Exception:
+        # Respaldo si no hay base de zonas horarias: Chile es UTC-3 / UTC-4
+        ahora = datetime.datetime.utcnow() - datetime.timedelta(hours=3)
+    return MESES_ABREV[ahora.month]
+
+
+def mes_de_factura(fecha_emision):
+    """
+    Abreviatura del mes SEGUN la fecha de emision de la factura.
+    Espera el formato 'DD-MM-AAAA' (tambien tolera '/' o '.'). Si no se puede
+    interpretar, devuelve None para que se use el mes actual como respaldo.
+    """
+    if not fecha_emision:
+        return None
+    partes = str(fecha_emision).replace("/", "-").replace(".", "-").split("-")
+    if len(partes) >= 2 and partes[1].strip().isdigit():
+        mes = int(partes[1])
+        if 1 <= mes <= 12:
+            return MESES_ABREV[mes]
+    return None
+
+
+def get_sheet(fecha_emision=None):
+    """
+    Devuelve la pestaña que corresponde a la FECHA DE LA FACTURA (p.ej. una
+    factura del 05-10-2026 va a la pestaña 'Oct'). Si la fecha no se puede
+    leer, usa el mes actual; si tampoco existe esa pestaña, usa la primera.
+    """
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(
         creds_dict,
@@ -91,7 +139,13 @@ def get_sheet():
         ],
     )
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID).get_worksheet(0)
+    ss = gc.open_by_key(SPREADSHEET_ID)
+    nombre_mes = mes_de_factura(fecha_emision) or mes_actual_abrev()
+    try:
+        return ss.worksheet(nombre_mes)
+    except Exception:
+        print(f"ADVERTENCIA: no existe la pestaña '{nombre_mes}'; se usa la primera pestaña.")
+        return ss.get_worksheet(0)
 
 
 # ---------- Extraccion de datos con Claude ----------
@@ -230,15 +284,17 @@ def prorratear_descuento(productos, descuento):
 
 
 # ---------- Escribir en Google Sheets ----------
-def primera_fila_vacia(sheet):
+def primera_fila_libre(sheet):
     """
-    Lectura 'fria' que se usa UNA sola vez (al arrancar o tras reinicio) para
-    saber en que fila retomar. Despues el worker lleva la cuenta en memoria.
+    Devuelve la fila inmediatamente DESPUES del ultimo dato de la columna B,
+    es decir, agrega siempre al final del bloque de datos.
+
+    gspread recorta las celdas vacias del final, asi que len(columna_b) es la
+    fila del ultimo dato. Si quedan filas en blanco intermedias (por una
+    limpieza manual, p.ej.) se ignoran: NO se escribe en medio, siempre al
+    final. Minimo fila 3 (fila 1 y 2 son titulo/encabezados).
     """
     columna_b = sheet.col_values(2)
-    for i in range(2, len(columna_b)):
-        if str(columna_b[i]).strip() == "":
-            return i + 1
     return max(len(columna_b) + 1, 3)
 
 
@@ -270,8 +326,8 @@ def aplicar_color(sheet, filas, color, col_inicio=1, col_fin=10):
 
 
 def agregar_filas(datos):
-    global proxima_fila
-    sheet = get_sheet()
+    sheet = get_sheet(datos.get("fecha_emision"))
+    titulo = sheet.title   # pestaña segun la fecha de la factura (p.ej. "Nov")
     total_factura = round(datos.get("total_factura") or 0)
     neto_factura  = datos.get("neto_factura") or 0
     descuento     = datos.get("descuento") or 0
@@ -280,9 +336,22 @@ def agregar_filas(datos):
     proveedor_nombre = datos.get("proveedor", "") or ""
     es_duplicada  = factura_duplicada(sheet, numero_factura)
 
-    # ----- Fila inicial en memoria (una sola vez) -----
-    if proxima_fila is None:
-        proxima_fila = primera_fila_vacia(sheet)
+    # ----- Decidir en que fila escribir (contador propio de esta pestaña) -----
+    # Siempre se consulta donde terminan los datos reales de la planilla.
+    fila_sheet = primera_fila_libre(sheet)
+    inactivo = (time.time() - ultima_escritura_ts.get(titulo, 0.0)) > SEGUNDOS_IDLE_RESYNC
+
+    if titulo not in proxima_fila or inactivo:
+        # Primera factura de esta pestaña, o empieza una tanda nueva tras una
+        # pausa: se confia en la planilla (asi se recoloca tras cambio de mes o
+        # limpieza manual, aunque implique volver a una fila mas arriba).
+        fila_destino = fila_sheet
+    else:
+        # Dentro de una rafaga rapida: Google Sheets puede no reflejar aun la
+        # fila recien escrita, asi que se usa el mayor entre el contador en
+        # memoria y lo que dice la planilla, para no pisar filas.
+        fila_destino = max(proxima_fila[titulo], fila_sheet)
+    proxima_fila[titulo] = fila_destino
 
     # ===== Caso especial: proveedores sin desglose (ej. Luz Parral) =====
     # Se usa UNA sola fila con los valores IMPRESOS de la factura:
@@ -342,11 +411,12 @@ def agregar_filas(datos):
             ])
 
     # ----- Escribir todas las filas de la factura en UNA sola llamada -----
-    fila_inicio = proxima_fila
-    fila_fin    = proxima_fila + len(matriz) - 1
+    fila_inicio = fila_destino
+    fila_fin    = fila_destino + len(matriz) - 1
     sheet.update(f"B{fila_inicio}:J{fila_fin}", matriz, value_input_option="USER_ENTERED")
     filas_escritas = list(range(fila_inicio, fila_fin + 1))
-    proxima_fila = fila_fin + 1   # avanzar en memoria, sin releer la planilla
+    proxima_fila[titulo] = fila_fin + 1        # avanzar el contador de esta pestaña
+    ultima_escritura_ts[titulo] = time.time()  # marcar la ultima escritura de esta pestaña
 
     # ----- Colores -----
     if es_duplicada:
